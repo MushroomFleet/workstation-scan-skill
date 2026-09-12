@@ -57,11 +57,15 @@ scan_date: 2026-09-12
 hostname: MSI
 os: Windows 11 Pro
 os_build: "10.0.26200"
-platform: win32
+platform: win32                        # win32 | darwin | linux
+cpu_arch: x86_64                       # x86_64 | arm64
+rosetta_translated: null               # macOS only: true if the scan shell ran under Rosetta
+virtualization_enabled: true           # firmware VT-x/AMD-V on Windows/Linux; kern.hv_support on macOS
 
 cpu: Intel Core Ultra 7 258V
 cpu_cores: 8
 cpu_threads: 8            # if == cores, there is no SMT; agents must not assume 2x
+cpu_topology: 4P+4LPE     # P/E core split where the CPU has one; null otherwise
 ram_total_gib: 31.5
 ram_free_idle_gib: 13.2
 ram_upgradeable: false
@@ -69,12 +73,18 @@ ram_upgradeable: false
 accelerator: Intel Arc 140V
 accelerator_vendor: intel              # nvidia | amd | intel | apple | none
 accelerator_kind: integrated           # discrete | integrated | unified
+gpu_cores: 8                           # Xe-cores / SMs / CUs / Apple GPU cores; null if unknown
+metal_version: null                    # macOS only, e.g. "Metal 4"
 torch_device: xpu                      # cuda | rocm | xpu | mps | cpu
 unified_memory: true                   # true => host<->device copies are cheap
 vram_dedicated_gib: 0
-vram_allocatable_gib: 16.0             # MEASURED ceiling — plan against this
+vram_allocatable_gib: 16.0             # plan-against figure — see "The three memory figures"
 recommended_dtype: bfloat16            # measured fastest, not assumed
+recommended_dtype_reason: throughput   # throughput | footprint — why it was chosen
 memory_bandwidth_gbs_effective: 83     # measured; null if not measured
+
+python_probed: C:/proj/.venv/Scripts/python.exe   # the interpreter the framework probes ran in
+python_arch: x86_64
 
 secondary_accelerators:
   - name: Intel AI Boost NPU
@@ -99,16 +109,88 @@ forbidden:                             # will fail on this machine — never att
 ---
 ```
 
+The same keys on an Apple Silicon Mac. Note which values change meaning, not just value:
+
+```yaml
+---
+scan_date: 2026-09-12
+hostname: SKYNET
+os: macOS 26.6.2
+os_build: "25G83"
+platform: darwin
+cpu_arch: arm64
+rosetta_translated: false
+virtualization_enabled: true
+
+cpu: Apple M4
+cpu_cores: 10
+cpu_threads: 10                        # no SMT on Apple Silicon
+cpu_topology: 4P+6E
+ram_total_gib: 16.0
+ram_free_idle_gib: 6.8
+ram_upgradeable: false
+
+accelerator: Apple M4
+accelerator_vendor: apple
+accelerator_kind: unified
+gpu_cores: 8
+metal_version: "Metal 4"
+torch_device: mps
+unified_memory: true
+vram_dedicated_gib: 0
+vram_allocatable_gib: 11.84            # Metal working-set budget — NOT the OOM ceiling (19 GiB, swapped)
+recommended_dtype: bfloat16
+recommended_dtype_reason: footprint    # measured only 8% faster than fp32; chosen for memory
+memory_bandwidth_gbs_effective: null
+
+python_probed: /Users/me/proj/.venv/bin/python
+python_arch: arm64
+
+secondary_accelerators:
+  - name: Apple Neural Engine
+    status: idle
+    reachable_via: Core ML / onnxruntime CoreMLExecutionProvider
+
+frameworks:
+  torch: { version: 2.10.0, device: mps, working: true }
+  mlx: { version: null, working: false }            # not installed
+  onnxruntime: { version: null, working: false }    # not installed
+  ollama: { version: 0.33.3, backend: Metal, working: true }
+
+storage_free_gib: 7.1
+storage_volumes: 1
+
+blockers:
+  - 7 GiB free disk — no room for models above ~5 GB
+  - float64 unsupported on MPS
+
+forbidden:
+  - cuda
+  - nvidia-smi
+  - bitsandbytes
+  - xpu
+  - torch.float64 on mps
+---
+```
+
 ### Notes on specific fields
 
 - **`cpu_threads`** — always state it. Modern CPUs may ship without SMT; an agent assuming
   `threads = 2 × cores` will oversubscribe.
-- **`vram_allocatable_gib`** — the measured ceiling from §4, never the OS-reported figure.
+- **`vram_allocatable_gib`** — the plan-against figure from §4, never the OS-reported figure. On a
+  discrete GPU that is the measured OOM ceiling; on a unified-memory machine it is the runtime's
+  working-set budget, because the OOM ceiling there includes swap.
 - **`unified_memory`** — `true` changes design decisions: host↔device transfer is nearly free, so
   streaming/offload schemes optimise a bottleneck that does not exist, while GPU allocations consume
-  the same pool as the host.
+  the same pool as the host — and can exceed it by swapping.
 - **`recommended_dtype`** — must come from a measurement. Vendor capability flags sometimes
-  contradict measured throughput.
+  contradict measured throughput. **`recommended_dtype_reason`** says whether the margin was large
+  enough to be a throughput choice or whether the dtype is recommended only to halve memory; an
+  agent porting a "bf16 is 8× faster" assumption from one machine to another is a real failure.
+- **`python_probed` / `python_arch`** — the profile describes one interpreter's reality. Name it.
+  On macOS an `x86_64` here is the decisive finding.
+- **Platform-inapplicable keys** (`metal_version` on Windows, `rosetta_translated` on Linux) are
+  `null`, not omitted, so agents can rely on the key set.
 - **`forbidden`** — the highest-value field for preventing wasted work. List tools and APIs that
   cannot work here.
 
@@ -137,6 +219,18 @@ Write them as instructions to a reader who will act:
 > - Plan against **16 GiB** of GPU memory, shared with system RAM; only ~13 GiB is free at idle.
 > - Use **8** worker threads, never 16 — 8 cores, no SMT.
 
+And the same section on an Apple Silicon Mac — note the memory and dtype directives say something
+structurally different, not just different numbers:
+
+> - Target **`mps`**. No CUDA, no XPU: `.cuda()`, `bitsandbytes`, `nvidia-smi` will fail. MLX is
+>   the other native path.
+> - Plan against **11.8 GiB** of GPU memory (Metal working-set budget), not the 16 GiB total. The
+>   allocator will grant more — measured 19 GiB — but it does so by swapping to SSD.
+> - Prefer **bf16 for footprint**; it measured only **~8 % faster than fp32**. Do not expect a
+>   matrix-engine speedup here.
+> - **`float64` is unsupported on MPS** — cast to float32 first.
+> - Use **10** threads (10 cores, no SMT); 4 are performance cores.
+
 ---
 
 ## 4. Required sections
@@ -145,14 +239,14 @@ In order. Merge or omit only where a section is genuinely inapplicable, and say 
 
 | # | Section | Must contain |
 |---|---|---|
-| 1 | **Platform Summary** | Make/model, form factor, board, firmware version + date, machine class. Flag thermally-constrained chassis — it changes how benchmarks must be read. |
+| 1 | **Platform Summary** | Make/model, form factor, board, firmware version + date, machine class, CPU architecture, and (macOS) whether the scan ran natively or under Rosetta. Flag thermally-constrained chassis — it changes how benchmarks must be read. |
 | 2 | **CPU** | Model, cores, **threads**, SMT presence, core topology (P/E), base + measured boost, cache, **virtualization enabled or not**. |
 | 3 | **Accelerator** | Model, vendor, driver + date, compute units, and **all three memory figures** (§below). State the addressing model (`cuda`/`xpu`/`mps`/…). |
 | 4 | **Secondary accelerators** | NPU/ANE/other. State honestly whether anything has ever exercised it. |
 | 5 | **Memory & Storage** | Capacity, type, speed, channels, **upgradeable or soldered**, free-at-idle, and free disk + volume count. Call out the tightest resource. |
-| 6 | **OS & Compute Runtimes** | OS build, and a runtime table with present/absent status: CUDA, ROCm, Level Zero, Metal, DirectML, Vulkan, OpenCL, OpenVINO. |
-| 7 | **Toolchain** | Language runtimes, package managers, compilers, build tools; and what is **missing** that tasks commonly need. |
-| 8 | **Framework Reality Check** | The §Step-3 probes. Build-variant suffixes verbatim, device counts, op-coverage result, provider lists. **The most important section.** |
+| 6 | **OS & Compute Runtimes** | OS build, and a runtime table with present/absent/N-A status: CUDA, ROCm, Level Zero, Metal, Core ML, DirectML, Vulkan, OpenCL, OpenVINO. Mark vendor-impossible runtimes N/A (Metal on Windows, CUDA on a Mac), not "missing". |
+| 7 | **Toolchain** | Language runtimes (with **architecture** on macOS), package managers, compilers, build tools, containers; and what is **missing** that tasks commonly need. |
+| 8 | **Framework Reality Check** | The §Step-3 probes. Build-variant suffixes / interpreter architecture verbatim, the interpreter path probed, device counts, op-coverage result with named failures, provider lists. **The most important section.** |
 | 9 | **Measured Performance** | Benchmarks with methodology and conditions (§7). |
 | 10 | **Constraints** | Severity table (§6), blockers first, each with a remedy. |
 | 11 | **Strengths** | What this machine is genuinely good at. Required — see §9. |
@@ -164,12 +258,15 @@ Always distinguish, and **name the one to plan against**:
 
 | Figure | Source | Use |
 |---|---|---|
-| OS/driver reported | WDDM total, registry, `system_profiler` | Accounting only. Usually the largest. **Do not plan against it.** |
-| Runtime reported | `total_memory` from CUDA / Level Zero / Metal / ROCm | The allocator's view. |
-| **Actually allocatable** | **Measured by allocating until OOM** | **Plan against this.** |
+| OS/driver reported | WDDM total, registry (Windows); `hw.memsize` (macOS) | Accounting only. Usually the largest. **Do not plan against it.** |
+| Runtime reported | `total_memory` from CUDA / Level Zero / ROCm; Metal `recommendedMaxWorkingSetSize` (`torch.mps.recommended_max_memory()`) | The allocator's budget. **Plan against this on unified memory.** |
+| Actually allocatable | Measured by allocating until failure | **Plan against this on a discrete GPU.** On unified memory, record it as *allocatable-with-swap* — evidence, not a budget. |
 
 These commonly differ by several GiB. Reporting only the first is the single most misleading thing
-this document can do.
+this document can do. The second most misleading is planning against the OOM ceiling on a
+unified-memory machine: measured on a 16 GB Apple Silicon Mac, PyTorch granted **19 GiB** before
+refusing, because the OS swapped everything else out rather than fail. Always state which memory
+model applies and therefore which row is the plan-against figure.
 
 ---
 
@@ -210,9 +307,10 @@ Each row: constraint, severity, **consequence**, and for blockers/high a **concr
 blockers first. Mark resolved constraints with strikethrough and a pointer to the resolving
 section rather than deleting them — the history is useful.
 
-Typical blockers worth checking for: CPU-only framework wheels on an accelerated machine;
-accelerated runtime absent; virtualization disabled in firmware; insufficient disk for the model
-class; an architecture the installed engine does not support.
+Typical blockers worth checking for: CPU-only framework wheels on an accelerated machine; an
+x86_64 interpreter on an arm64 Mac; accelerated runtime absent; virtualization disabled in
+firmware; insufficient disk for the model class; an architecture the installed engine does not
+support.
 
 ---
 
@@ -268,7 +366,11 @@ mark corrections per SKILL.md.
 - **Report vendor specs as achievements.** "64 TOPS" means nothing if nothing has ever run on it.
   State idle hardware as idle.
 - **Give one memory number.** See §4.
-- **Infer a dtype ranking.** Measure it.
+- **Plan against the OOM ceiling on unified memory.** It includes swap. See §4.
+- **Infer a dtype ranking.** Measure it — and report the margin, so a negligible one is not read
+  as a large one.
+- **Probe the wrong interpreter.** The system Python is rarely what a task runs in. Name the one
+  probed.
 - **Assume SMT.** Check threads.
 - **Trust a library's presence as capability.** Probe the device.
 - **Assert unverified conditions** (power source, thermals, link speed). The most likely error in
@@ -313,7 +415,7 @@ mark corrections per SKILL.md.
 ## Case Study — <task> (<date>)     <!-- optional, preserved across updates -->
 
 ---
-*Collected via <commands>. <Notes on unavailable commands.>*
+*Collected on <platform> via `references/platform-<os>.md` using <commands>. <Notes on unavailable commands and anything requiring elevated privileges that was not run.>*
 ```
 
 Tables over prose for anything enumerable. Callouts (`>`) for facts that change decisions. Fenced

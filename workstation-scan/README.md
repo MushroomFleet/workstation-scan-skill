@@ -6,6 +6,10 @@
 accelerator and toolchain report structured for an AI agent to parse in seconds and for a human to
 read in full. Drop it in a repo and any agent working there stops guessing about your hardware.
 
+**V2 runs on Windows and macOS** (Apple Silicon and Intel Macs) with one shared procedure and one
+document format, so a `Workstation.md` from either platform has the same keys and the same
+structure.
+
 Its governing principle is one line long:
 
 > **Reported capability and actual working capability routinely disagree. Measure, don't assume.**
@@ -30,6 +34,11 @@ measured bf16 throughput.
 
 No amount of reading spec sheets would catch that. Running one command would.
 
+The Mac version of the same lie, found while building V2: on a 16 GB Apple Silicon MacBook,
+PyTorch's MPS allocator **granted 19 GiB** before refusing. It did not fail — macOS paged
+everything else out to the SSD. An agent that "measured" the allocation ceiling and planned against
+it would have been planning against swap. The real budget was the Metal working set: **11.8 GiB**.
+
 `workstation-scan` catches exactly this class of problem, then writes the answer down so it is
 found once rather than rediscovered.
 
@@ -39,7 +48,10 @@ found once rather than rediscovered.
 - "The GPU isn't being used" mysteries caused by a CPU-only wheel
 - Planning around VRAM figures the allocator will never grant
 - Assuming `threads = 2 × cores` on a CPU without SMT
-- Choosing fp32 where a matrix engine makes bf16 several times faster
+- Choosing fp32 where a matrix engine makes bf16 several times faster — or assuming bf16 is
+  several times faster on a GPU where it measured 8 % faster
+- Planning against a unified-memory "allocation ceiling" that is really swap
+- Probing the system Python when the project runs in an arm64 venv (or the reverse, under Rosetta)
 - Re-attempting an approach that already failed on this hardware last week
 
 ---
@@ -107,6 +119,12 @@ GPU memory is reported differently by every layer, and the numbers genuinely dis
 
 On the machine above these read **18 GiB / 16.46 GiB / 16 GiB**. Reporting only the first is the
 most misleading thing such a document can do.
+
+Which of the last two is the plan-against figure depends on the memory model, and the skill says
+which. On a discrete GPU the measured ceiling governs. On **unified memory** (Apple Silicon,
+integrated GPUs) the runtime budget governs, because the ceiling includes swap — on the M4 MacBook
+the three figures read **16 GiB / 11.84 GiB / 19 GiB**, and only the middle one is safe to plan
+against.
 
 ### Every claim carries its provenance
 
@@ -188,32 +206,60 @@ when you ask.
 
 ```
 workstation-scan/
-├── SKILL.md                            # Procedure: detect, probe, verify, write
+├── SKILL.md                            # Shared procedure: mode, detect OS, probe, verify, write
 ├── references/
-│   └── Workstation-grounding.md        # The document standard (authoritative on content)
+│   ├── Workstation-grounding.md        # The document standard (authoritative on content)
+│   ├── platform-windows.md             # Windows commands, WDDM memory sources, +cpu-wheel probe
+│   └── platform-macos.md               # macOS commands, unified-memory rules, Rosetta/MPS/MLX/ANE
 └── README.md
 ```
 
-The split is deliberate. `SKILL.md` governs *how to scan* and stays short enough to load cheaply;
-the grounding governs *what goes in the document* and is read only when the skill runs.
+The split is deliberate. `SKILL.md` governs *how to scan* and is platform-neutral, so it stays
+short enough to load cheaply. It detects the OS and loads exactly one platform reference, which
+carries that platform's commands and gotchas. The grounding governs *what goes in the document*
+and is the same on every platform.
 
 ---
 
 ## 💻 Platform support
 
-| Platform | Status |
-|---|---|
-| **Windows** | Full — `Get-CimInstance`, `Get-PnpDevice`, `powercfg`, registry |
-| **Linux** | Full — `lscpu`, `lspci`, `dmidecode`, `/proc`, `/sys` |
-| **macOS** | Full — `system_profiler`, `sysctl`, `pmset` |
+| Platform | Status | Reference |
+|---|---|---|
+| **Windows** | Full — `Get-CimInstance`, `Get-PnpDevice`, `powercfg`, registry; unchanged from V1 | `references/platform-windows.md` |
+| **macOS — Apple Silicon** | Full — `system_profiler`, `sysctl`, `pmset`, `diskutil`, `ioreg`; MPS, MLX, Core ML, llama.cpp/Ollama Metal | `references/platform-macos.md` |
+| **macOS — Intel** | Degraded path — inventory and Metal-on-AMD; no ANE, no MLX | `references/platform-macos.md` §M1 |
+| **Linux** | Fallback command table in `SKILL.md`; shared probes apply | — |
 
 Accelerators: **NVIDIA** (CUDA), **AMD** (ROCm), **Intel** (XPU / Level Zero / SYCL), **Apple**
-(Metal / MPS), plus **Vulkan**, **OpenCL**, **DirectML** and **OpenVINO** runtimes, and NPU/ANE
-detection.
+(Metal / MPS / MLX), plus **Vulkan**, **OpenCL**, **DirectML**, **OpenVINO** and **Core ML**
+runtimes, and NPU/ANE detection.
 
 > **Windows note baked into the skill:** `wmic` is removed on Windows 11 builds ≈26100+. The skill
 > uses `Get-CimInstance` and knows not to retry `wmic` variants when it fails — a failure that
 > reads like a path error but isn't.
+
+> **macOS notes baked into the skill:** the scan never needs `sudo` (thermal and ANE power figures
+> from `powermetrics` are recorded as "not run"); `df -h /` reports the sealed system snapshot, so
+> the Data volume is measured instead; `system_profiler` prints serial numbers and UUIDs that must
+> be stripped; the system `python3` is a universal 3.9 with no ML packages, so the skill hunts for
+> the project venv and records which interpreter it probed; and `float64` on MPS is a known dead
+> end, recorded up front.
+
+### What changed in V2
+
+- `SKILL.md` is now platform-neutral. Windows procedure moved verbatim to
+  `references/platform-windows.md`; macOS procedure is new in `references/platform-macos.md`.
+- Frontmatter gained fixed keys: `cpu_arch`, `cpu_topology`, `gpu_cores`, `metal_version`,
+  `rosetta_translated`, `virtualization_enabled`, `python_probed`, `python_arch`,
+  `recommended_dtype_reason`. Keys that do not apply to a platform are `null`, never omitted.
+- The memory rule now says which figure to plan against **per memory model** — measured ceiling on
+  discrete GPUs, runtime budget on unified memory.
+- Dtype ranking must report its margin, and `recommended_dtype_reason` says whether the dtype is
+  chosen for throughput or for footprint.
+- The "expensive lie" is documented per platform: the `+cpu` wheel on Windows, the x86_64
+  interpreter under Rosetta on macOS.
+- Update mode refuses to "update" a profile written on a different platform — a cloned repo's
+  Windows `Workstation.md` is not the Mac it now sits on.
 
 ---
 
@@ -243,7 +289,7 @@ If you use this codebase in your research or project, please cite:
   author = {Drift Johnson},
   year = {2026},
   url = {https://github.com/MushroomFleet/workstation-scan-skill},
-  version = {1.0.0}
+  version = {2.0.0}
 }
 ```
 
