@@ -194,7 +194,11 @@ a = mx.random.normal((2048, 2048)); mx.eval(a @ a)     # a real op — import al
 ```
 
 MLX is Apple-Silicon-only and always uses unified memory; there is no device to choose. Time a
-matmul in fp32 / fp16 / bf16 exactly as for torch and rank them.
+matmul in fp32 / fp16 / bf16 exactly as for torch and rank them. Record
+`max_recommended_working_set_size` (it should equal `torch.mps.recommended_max_memory()` — if it
+does not, say so) and `max_buffer_length`, the largest single allocation MLX will make. `float64`
+fails on the MLX GPU device exactly as on MPS (`ValueError: float64 is not supported on the GPU`);
+record it alongside the MPS gap.
 
 ### ONNX Runtime (CoreML provider)
 
@@ -205,7 +209,46 @@ print(ort.__version__, ort.get_available_providers())
 ```
 
 The stock `onnxruntime` PyPI wheel for macOS **does** include CoreML. If only
-`CPUExecutionProvider` appears, an x86_64 or Linux wheel is installed.
+`CPUExecutionProvider` appears, an x86_64 or Linux wheel is installed. `AzureExecutionProvider` in
+the list is a remote-inference stub, not local acceleration — ignore it.
+
+**A listed provider proves nothing.** Run a real session and confirm the runtime actually assigned
+nodes to CoreML. Building a test model needs the `onnx` package (small); if it is absent, say so
+and record the provider as "listed, unverified" rather than "working":
+
+```python
+import numpy as np, onnxruntime as ort, time
+try:
+    import onnx
+    from onnx import helper, TensorProto
+except ImportError:
+    print("onnx absent — CoreML EP listed but UNVERIFIED (pip install onnx to test)"); raise SystemExit
+X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 256])
+Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 256])
+W = helper.make_tensor("W", TensorProto.FLOAT, [256, 256],
+                       np.random.randn(256, 256).astype(np.float32).flatten().tolist())
+g = helper.make_graph([helper.make_node("MatMul", ["X", "W"], ["Y"])], "g", [X], [Y], [W])
+m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)]); m.ir_version = 8
+onnx.save(m, "tiny.onnx")
+
+so = ort.SessionOptions(); so.log_severity_level = 1     # INFO: prints the GetCapability line
+x = np.random.randn(1, 256).astype(np.float32)
+for prov in (["CoreMLExecutionProvider", "CPUExecutionProvider"], ["CPUExecutionProvider"]):
+    s = ort.InferenceSession("tiny.onnx", so, providers=prov)
+    s.run(None, {"X": x})
+    ts = sorted(time.perf_counter() - t0 for _ in range(20) for t0 in [time.perf_counter()] if s.run(None, {"X": x}) is not None)
+    print(prov[0], "actual providers", s.get_providers(), f"median {ts[10]*1e6:.0f} us")
+```
+
+The proof is the INFO line `CoreMLExecutionProvider::GetCapability … number of nodes supported by
+CoreML: 1` followed by `Writing CoreML Model to …mlmodel`. Record it verbatim. Two caveats to
+write down:
+
+- **CoreML ≠ ANE.** Core ML picks ANE, GPU or CPU per op at runtime and does not say which.
+  Without `sudo powermetrics --samplers ane_power` the ANE stays `status: idle` / unverified.
+- **On a tiny graph the CoreML EP is slower than the CPU EP** (measured 121 µs vs 10 µs on a
+  256×256 MatMul) because dispatch overhead dominates. That is expected, not a defect — but it
+  means the EP must be benchmarked on the real model before an agent chooses it.
 
 ### llama.cpp / Metal
 
